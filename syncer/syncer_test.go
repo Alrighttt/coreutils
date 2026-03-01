@@ -75,12 +75,13 @@ func newTestSyncer(t testing.TB, opts ...syncer.Option) (*syncer.Syncer, *chain.
 		l.Close()
 	})
 
-	opts = append([]syncer.Option{syncer.WithSyncInterval(100 * time.Millisecond)}, opts...)
-	s := syncer.New(l, cm, testutil.NewEphemeralPeerStore(), gateway.Header{
+	c := syncer.NewGatewayConnector(l, gateway.Header{
 		GenesisID:  genesis.ID(),
 		UniqueID:   gateway.GenerateUniqueID(),
 		NetAddress: l.Addr().String(),
-	}, opts...)
+	}, nil, 10*time.Second)
+	opts = append([]syncer.Option{syncer.WithSyncInterval(100 * time.Millisecond)}, opts...)
+	s := syncer.New(c, cm, testutil.NewEphemeralPeerStore(), opts...)
 	go s.Run()
 	return s, cm
 }
@@ -148,11 +149,11 @@ func TestSyncWithBadPeer(t *testing.T) {
 		t.Fatal(err)
 	}
 	badID := gateway.GenerateUniqueID()
-	s3 := syncer.New(l, evilManager{cm1}, testutil.NewEphemeralPeerStore(), gateway.Header{
+	s3 := syncer.New(syncer.NewGatewayConnector(l, gateway.Header{
 		GenesisID:  genesis.ID(),
 		UniqueID:   badID,
 		NetAddress: l.Addr().String(),
-	})
+	}, nil, 10*time.Second), evilManager{cm1}, testutil.NewEphemeralPeerStore())
 	go s3.Run()
 	defer s3.Close()
 
@@ -276,11 +277,11 @@ func TestInstantSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l.Close()
-	s2 := syncer.New(l, cm2, testutil.NewEphemeralPeerStore(), gateway.Header{
+	s2 := syncer.New(syncer.NewGatewayConnector(l, gateway.Header{
 		GenesisID:  genesis.ID(),
 		UniqueID:   gateway.GenerateUniqueID(),
 		NetAddress: l.Addr().String(),
-	}, syncer.WithSyncInterval(100*time.Millisecond))
+	}, nil, 10*time.Second), cm2, testutil.NewEphemeralPeerStore(), syncer.WithSyncInterval(100*time.Millisecond))
 	defer s2.Close()
 	if _, err := s2.Connect(context.Background(), s.Addr()); err != nil {
 		t.Fatal(err)
@@ -442,11 +443,11 @@ func TestForkPeerSynced(t *testing.T) {
 	}
 	t.Cleanup(func() { l2.Close() })
 
-	s2 := syncer.New(l2, cm2, testutil.NewEphemeralPeerStore(), gateway.Header{
+	s2 := syncer.New(syncer.NewGatewayConnector(l2, gateway.Header{
 		GenesisID:  genesis.ID(),
 		UniqueID:   gateway.GenerateUniqueID(),
 		NetAddress: l2.Addr().String(),
-	}, syncer.WithSyncInterval(time.Hour)) // effectively disabled
+	}, nil, 10*time.Second), cm2, testutil.NewEphemeralPeerStore(), syncer.WithSyncInterval(time.Hour)) // effectively disabled
 	go s2.Run()
 	defer s2.Close()
 
@@ -517,11 +518,11 @@ func TestParallelSyncStall(t *testing.T) {
 	t.Cleanup(func() { l2.Close() })
 
 	stuckCM := &stallManager{Manager: cm2}
-	s2 := syncer.New(l2, stuckCM, testutil.NewEphemeralPeerStore(), gateway.Header{
+	s2 := syncer.New(syncer.NewGatewayConnector(l2, gateway.Header{
 		GenesisID:  genesis.ID(),
 		UniqueID:   gateway.GenerateUniqueID(),
 		NetAddress: l2.Addr().String(),
-	}, syncer.WithSyncInterval(100*time.Millisecond))
+	}, nil, 10*time.Second), stuckCM, testutil.NewEphemeralPeerStore(), syncer.WithSyncInterval(100*time.Millisecond))
 	go s2.Run()
 	defer s2.Close()
 

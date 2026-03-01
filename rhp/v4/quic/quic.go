@@ -332,3 +332,49 @@ func Serve(l *quic.Listener, s *rhp4.Server, opts ...ServeOption) {
 		}
 	}
 }
+
+func applyServeOpts(opts []ServeOption) *serveOptions {
+	o := &serveOptions{
+		log: zap.NewNop(),
+		streamMiddleware: func(nc net.Conn) net.Conn {
+			return nc
+		},
+	}
+	for _, opt := range opts {
+		opt(o)
+	}
+	return o
+}
+
+// RHP4Handler returns an HTTP handler that upgrades WebTransport sessions
+// and serves them with the given RHP4 server. Mount this on a shared
+// http.ServeMux at "/sia/rhp/v4".
+func RHP4Handler(wts *webtransport.Server, s *rhp4.Server, opts ...ServeOption) http.HandlerFunc {
+	o := applyServeOpts(opts)
+	return func(w http.ResponseWriter, r *http.Request) {
+		sess, err := wts.Upgrade(w, r)
+		if err != nil {
+			o.log.Debug("webtransport upgrade failed", zap.Error(err))
+			return
+		}
+		defer sess.CloseWithError(0, "")
+
+		err = s.Serve(&webTransport{
+			sess:             sess,
+			streamMiddleware: o.streamMiddleware,
+		}, o.log)
+		if err != nil {
+			o.log.Debug("failed to serve connection", zap.Error(err))
+		}
+	}
+}
+
+// ServeRHP4Conn serves a single raw QUIC RHP4 connection (non-HTTP3 path).
+// The caller is responsible for closing conn after this returns.
+func ServeRHP4Conn(conn *quic.Conn, s *rhp4.Server, opts ...ServeOption) {
+	o := applyServeOpts(opts)
+	log := o.log.With(zap.String("peerAddress", conn.RemoteAddr().String()))
+	if err := s.Serve(&transport{qc: conn, streamMiddleware: o.streamMiddleware}, log); err != nil {
+		log.Debug("failed to serve quic connection", zap.Error(err))
+	}
+}

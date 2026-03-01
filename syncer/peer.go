@@ -17,7 +17,7 @@ import (
 
 // A Peer is a connected gateway peer.
 type Peer struct {
-	t *gateway.Transport
+	t PeerTransport
 
 	ConnAddr string
 	Inbound  bool
@@ -35,13 +35,13 @@ func (p *Peer) String() string {
 }
 
 // Addr returns the peer's reported dialback address.
-func (p *Peer) Addr() string { return p.t.Addr }
+func (p *Peer) Addr() string { return p.t.Addr() }
 
 // Version returns the peer's reported version.
-func (p *Peer) Version() string { return p.t.Version }
+func (p *Peer) Version() string { return p.t.Version() }
 
 // UniqueID returns the peer's reported UniqueID.
-func (p *Peer) UniqueID() gateway.UniqueID { return p.t.UniqueID }
+func (p *Peer) UniqueID() gateway.UniqueID { return p.t.UniqueID() }
 
 // Err returns the error that caused the peer to disconnect, if any.
 func (p *Peer) Err() error {
@@ -265,7 +265,7 @@ func (s *Syncer) handleRPC(id types.Specifier, stream *gateway.Stream, origin *P
 		return nil
 
 	case *gateway.RPCDiscoverIP:
-		r.IP, _, _ = net.SplitHostPort(origin.t.Addr)
+		r.IP, _, _ = net.SplitHostPort(origin.t.Addr())
 		if err := stream.WriteResponse(r); err != nil {
 			return err
 		}

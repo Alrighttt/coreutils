@@ -254,11 +254,9 @@ type Dialer interface {
 
 // A Syncer synchronizes blockchain data with peers.
 type Syncer struct {
-	d      Dialer
-	l      net.Listener
+	c      Connector
 	cm     ChainManager
 	pm     PeerStore
-	header gateway.Header
 	config config
 	log    *zap.Logger // redundant, but convenient
 
@@ -273,7 +271,7 @@ type Syncer struct {
 func (s *Syncer) resync(p *Peer, reason string) {
 	if p.Synced() {
 		p.setSynced(false)
-		s.log.Debug("resync triggered", zap.String("peer", p.t.Addr), zap.String("reason", reason))
+		s.log.Debug("resync triggered", zap.String("peer", p.t.Addr()), zap.String("reason", reason))
 	}
 }
 
@@ -315,16 +313,16 @@ func (s *Syncer) ban(p *Peer, err error) error {
 // addPeer adds a peer to the Syncer. If it returns without error it must be
 // passed to runPeer to ensure it gets removed.
 func (s *Syncer) addPeer(p *Peer) error {
-	if err := s.pm.AddPeer(p.t.Addr); err != nil {
+	if err := s.pm.AddPeer(p.t.Addr()); err != nil {
 		return fmt.Errorf("failed to add peer: %w", err)
-	} else if err := s.pm.UpdatePeerInfo(p.t.Addr, func(info *PeerInfo) {
+	} else if err := s.pm.UpdatePeerInfo(p.t.Addr(), func(info *PeerInfo) {
 		info.LastConnect = time.Now()
 	}); err != nil {
 		return fmt.Errorf("failed to update peer info: %w", err)
 	}
 
 	s.mu.Lock()
-	s.peers[p.t.Addr] = p
+	s.peers[p.t.Addr()] = p
 	s.mu.Unlock()
 	return nil
 }
@@ -332,7 +330,7 @@ func (s *Syncer) addPeer(p *Peer) error {
 func (s *Syncer) runPeer(p *Peer) {
 	defer func() {
 		s.mu.Lock()
-		delete(s.peers, p.t.Addr)
+		delete(s.peers, p.t.Addr())
 		s.mu.Unlock()
 
 		// notify goroutines of removed peer
@@ -352,9 +350,11 @@ func (s *Syncer) runPeer(p *Peer) {
 		}
 		id, stream, err := p.acceptRPC()
 		if err != nil {
+			s.log.Debug("acceptRPC failed, disconnecting peer", zap.Stringer("peer", p), zap.Error(err))
 			p.setErr(err)
 			return
 		}
+		s.log.Debug("accepted RPC", zap.Stringer("peer", p), zap.Stringer("rpc", id))
 		select {
 		case inflight <- struct{}{}:
 		case <-s.tg.Done():
@@ -374,6 +374,8 @@ func (s *Syncer) runPeer(p *Peer) {
 				s.log.Debug("failed to set rpc deadline", zap.Error(err))
 			} else if err := s.handleRPC(id, stream, p); err != nil {
 				s.log.Debug("rpc failed", zap.Stringer("peer", p), zap.Stringer("rpc", id), zap.Error(err))
+			} else {
+				s.log.Debug("rpc completed", zap.Stringer("peer", p), zap.Stringer("rpc", id))
 			}
 		}()
 	}
@@ -483,7 +485,7 @@ func (s *Syncer) alreadyConnected(id gateway.UniqueID) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, p := range s.peers {
-		if p.t.UniqueID == id {
+		if p.t.UniqueID() == id {
 			return true
 		}
 	}
@@ -504,41 +506,41 @@ func (s *Syncer) acceptLoop(ctx context.Context) error {
 		default:
 		}
 
-		conn, err := s.l.Accept()
+		t, connAddr, err := s.c.Accept(ctx)
 		if err != nil {
 			return err
 		}
 
+		s.log.Debug("accepted inbound connection", zap.String("connAddr", connAddr), zap.String("peerAddr", t.Addr()))
+
 		go func() {
 			done, err := s.tg.Add()
 			if err != nil {
+				t.Close()
 				return
 			}
 			defer done()
-			defer conn.Close()
-			// set timeout for initial handshake
-			conn.SetDeadline(time.Now().Add(s.config.ConnectTimeout))
-			if err := s.allowConnect(ctx, conn.RemoteAddr().String(), true); err != nil {
-				s.log.Debug("rejected inbound connection", zap.Stringer("remoteAddress", conn.RemoteAddr()), zap.Error(err))
+			if err := s.allowConnect(ctx, connAddr, true); err != nil {
+				s.log.Debug("rejected inbound connection", zap.String("connAddr", connAddr), zap.Error(err))
+				t.Close()
 				return
 			}
-
-			t, err := gateway.Accept(conn, s.header)
-			if err != nil || s.alreadyConnected(t.UniqueID) {
-				// note: most likely a timeout or other temp network error.
-				// logging is very noisy
+			if s.alreadyConnected(t.UniqueID()) {
+				s.log.Debug("already connected to peer", zap.String("connAddr", connAddr))
+				t.Close()
 				return
 			}
-			conn.SetDeadline(time.Time{})
 			p := &Peer{
 				t:        t,
-				ConnAddr: conn.RemoteAddr().String(),
+				ConnAddr: connAddr,
 				Inbound:  true,
 			}
 			if err := s.addPeer(p); err != nil {
-				s.log.Debug("failed to add peer", zap.Stringer("remoteAddress", conn.RemoteAddr()), zap.Error(err))
+				s.log.Debug("failed to add peer", zap.String("connAddr", connAddr), zap.Error(err))
+				t.Close()
 				return
 			}
+			s.log.Debug("peer added, starting RPC loop", zap.Stringer("peer", p))
 			s.runPeer(p)
 		}()
 	}
@@ -753,7 +755,7 @@ func (s *Syncer) Run() error {
 	err = <-errChan
 
 	// when one goroutine exits, shutdown and wait for the others
-	s.l.Close()
+	s.c.Close()
 	s.mu.Lock()
 	for _, p := range s.peers {
 		p.Close()
@@ -775,9 +777,9 @@ func (s *Syncer) Run() error {
 	return err
 }
 
-// Close closes the Syncer's net.Listener.
+// Close closes the Syncer's underlying connector.
 func (s *Syncer) Close() error {
-	err := s.l.Close()
+	err := s.c.Close()
 	s.tg.Stop()
 	return err
 }
@@ -790,23 +792,16 @@ func (s *Syncer) Connect(ctx context.Context, addr string) (*Peer, error) {
 	}
 	defer done()
 
-	conn, err := s.d.DialContext(ctx, "tcp", addr)
+	t, connAddr, err := s.c.Dial(ctx, addr)
 	if err != nil {
 		return nil, err
-	}
-	conn.SetDeadline(time.Now().Add(s.config.ConnectTimeout))
-	defer conn.SetDeadline(time.Time{})
-	t, err := gateway.Dial(conn, s.header)
-	if err != nil {
-		conn.Close()
-		return nil, err
-	} else if s.alreadyConnected(t.UniqueID) {
-		conn.Close()
+	} else if s.alreadyConnected(t.UniqueID()) {
+		t.Close()
 		return nil, errors.New("already connected")
 	}
 	p := &Peer{
 		t:        t,
-		ConnAddr: conn.RemoteAddr().String(),
+		ConnAddr: connAddr,
 		Inbound:  false,
 	}
 	if err := s.addPeer(p); err != nil {
@@ -851,21 +846,19 @@ func (s *Syncer) PeerInfo(addr string) (PeerInfo, error) {
 
 // Addr returns the address of the Syncer.
 func (s *Syncer) Addr() string {
-	return s.l.Addr().String()
+	return s.c.Addr()
 }
 
 // New returns a new Syncer.
-func New(l net.Listener, cm ChainManager, pm PeerStore, header gateway.Header, opts ...Option) *Syncer {
+func New(c Connector, cm ChainManager, pm PeerStore, opts ...Option) *Syncer {
 	config := defaultConfig()
 	for _, opt := range opts {
 		opt(&config)
 	}
 	s := &Syncer{
-		d:       config.Dialer,
-		l:       l,
+		c:       c,
 		cm:      cm,
 		pm:      pm,
-		header:  header,
 		config:  config,
 		log:     config.Logger,
 		peers:   make(map[string]*Peer),
@@ -938,7 +931,7 @@ func RetrieveCheckpoint(ctx context.Context, peers []string, index types.ChainIn
 					return
 				}
 				p := &Peer{
-					t:        t,
+					t:        NewGatewayTransport(t),
 					ConnAddr: conn.RemoteAddr().String(),
 					Inbound:  false,
 				}

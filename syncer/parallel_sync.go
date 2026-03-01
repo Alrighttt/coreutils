@@ -96,7 +96,7 @@ func (s *Syncer) parallelSync(ctx context.Context, cs consensus.State, headers [
 			resp.blocks = blocks
 		}
 		endTime := time.Now()
-		s.pm.UpdatePeerInfo(p.t.Addr, func(info *PeerInfo) {
+		s.pm.UpdatePeerInfo(p.t.Addr(), func(info *PeerInfo) {
 			info.SyncedBlocks += req.numBlocks
 			info.SyncDuration += endTime.Sub(startTime)
 		})
@@ -168,10 +168,10 @@ func (s *Syncer) parallelSync(ctx context.Context, cs consensus.State, headers [
 			// spawn worker goroutines for any new peers
 			s.mu.Lock()
 			for _, p := range s.peers {
-				if p.Err() != nil || p.Synced() || seen[p.t.UniqueID] {
+				if p.Err() != nil || p.Synced() || seen[p.t.UniqueID()] {
 					continue
 				}
-				seen[p.t.UniqueID] = true
+				seen[p.t.UniqueID()] = true
 				activeWorkers.Add(1)
 				wg.Add(1)
 				go func(p *Peer) {

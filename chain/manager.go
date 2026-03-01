@@ -232,7 +232,7 @@ func (m *Manager) BlocksForHistory(history []types.BlockID, maxBlocks uint64) ([
 		}
 		b, _, ok := m.store.Block(index.ID)
 		if !ok {
-			return nil, 0, fmt.Errorf("missing block %v", index)
+			return nil, 0, fmt.Errorf("%w: %v", ErrMissingBlock, index)
 		}
 		blocks[i] = b
 	}
@@ -282,12 +282,14 @@ func (m *Manager) AddBlocks(blocks []types.Block) error {
 	if cs.SufficientlyHeavierThan(m.tipState) {
 		oldTip := m.tipState.Index
 		log.Debug("reorging to", zap.Stringer("current", oldTip), zap.Stringer("target", cs.Index))
+		tReorg := time.Now()
 		if err := m.reorgTo(cs.Index); err != nil {
 			if err := m.reorgTo(oldTip); err != nil {
 				return fmt.Errorf("failed to revert failed reorg: %w", err)
 			}
 			return fmt.Errorf("reorg failed: %w", err)
 		}
+		reorgDur := time.Since(tReorg)
 		// release lock while notifying listeners
 		tip := m.tipState.Index
 		fns := make([]func(), 0, len(m.onReorg)+len(m.onPool))
@@ -298,8 +300,17 @@ func (m *Manager) AddBlocks(blocks []types.Block) error {
 			fns = append(fns, fn)
 		}
 		m.mu.Unlock()
+		tNotify := time.Now()
 		for _, fn := range fns {
 			fn()
+		}
+		notifyDur := time.Since(tNotify)
+		if reorgDur+notifyDur > 100*time.Millisecond {
+			log.Info("AddBlocks timing",
+				zap.Duration("reorgTo", reorgDur),
+				zap.Duration("notifySubscribers", notifyDur),
+				zap.Uint64("tipHeight", tip.Height),
+			)
 		}
 		m.mu.Lock()
 	}
@@ -478,22 +489,46 @@ func (m *Manager) reorgPath(a, b types.ChainIndex) (revert, apply []types.ChainI
 }
 
 func (m *Manager) reorgTo(index types.ChainIndex) error {
+	t0 := time.Now()
 	revert, apply, err := m.reorgPath(m.tipState.Index, index)
 	if err != nil {
 		return err
 	}
+	tPath := time.Since(t0)
+
+	t0 = time.Now()
 	for range revert {
 		if err := m.revertTip(); err != nil {
 			return fmt.Errorf("couldn't revert block %v: %w", m.tipState.Index, err)
 		}
 	}
+	tRevert := time.Since(t0)
+
+	t0 = time.Now()
 	for _, index := range apply {
 		if err := m.applyTip(index); err != nil {
 			return fmt.Errorf("couldn't apply block %v: %w", index, err)
 		}
 	}
+	tApply := time.Since(t0)
+
+	t0 = time.Now()
 	if err := m.store.Flush(); err != nil {
 		return err
+	}
+	tFlush := time.Since(t0)
+
+	total := tPath + tRevert + tApply + tFlush
+	if total > 100*time.Millisecond {
+		m.log.Info("reorgTo timing",
+			zap.Duration("total", total),
+			zap.Duration("reorgPath", tPath),
+			zap.Duration("revertTips", tRevert),
+			zap.Duration("applyTips", tApply),
+			zap.Duration("flush", tFlush),
+			zap.Int("numRevert", len(revert)),
+			zap.Int("numApply", len(apply)),
+		)
 	}
 
 	// invalidate txpool caches

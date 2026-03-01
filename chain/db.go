@@ -8,6 +8,7 @@ import (
 	"iter"
 	"math/bits"
 	"sort"
+	"sync"
 	"time"
 
 	"go.sia.tech/core/consensus"
@@ -406,12 +407,14 @@ var (
 	bSiacoinElements      = []byte("SiacoinElements")
 	bSiafundElements      = []byte("SiafundElements")
 	bTree                 = []byte("Tree")
+	bBlockHeights         = []byte("BlockHeights") // reverse index: block_id → height
 
 	keyHeight = []byte("Height")
 )
 
 // DBStore implements Store using a key-value database.
 type DBStore struct {
+	mu  sync.Mutex
 	db  DB
 	n   *consensus.Network // for getState
 	enc types.Encoder
@@ -450,13 +453,41 @@ func (db *DBStore) putHeight(height uint64) {
 
 func (db *DBStore) getState(id types.BlockID) (consensus.State, bool) {
 	var vs versionedState
-	ok := db.bucket(bStates).get(id[:], &vs)
-	vs.State.Network = db.n
-	return vs.State, ok
+	if ok := db.bucket(bStates).get(id[:], &vs); ok {
+		vs.State.Network = db.n
+		return vs.State, true
+	}
+	// fallback: check block heights reverse index (for backfilled blocks
+	// that don't have a full consensus state stored)
+	if h, ok := db.getBlockHeight(id); ok {
+		return consensus.State{
+			Index:   types.ChainIndex{Height: h, ID: id},
+			Network: db.n,
+		}, true
+	}
+	return consensus.State{}, false
 }
 
 func (db *DBStore) putState(cs consensus.State) {
 	db.bucket(bStates).put(cs.Index.ID[:], versionedState{cs})
+}
+
+func (db *DBStore) putBlockHeight(id types.BlockID, height uint64) {
+	if b := db.bucket(bBlockHeights); b.b != nil {
+		b.putRaw(id[:], db.encHeight(height))
+	} else {
+		// bucket doesn't exist yet (pre-existing DB); create it
+		db.db.CreateBucket(bBlockHeights)
+		db.bucket(bBlockHeights).putRaw(id[:], db.encHeight(height))
+	}
+}
+
+func (db *DBStore) getBlockHeight(id types.BlockID) (uint64, bool) {
+	val := db.bucket(bBlockHeights).getRaw(id[:])
+	if len(val) != 8 {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(val), true
 }
 
 func (db *DBStore) getBlock(id types.BlockID) (bh types.BlockHeader, b *types.Block, bs *consensus.V1BlockSupplement, _ bool) {
@@ -615,6 +646,8 @@ func (db *DBStore) putFileContractExpiration(id types.FileContractID, windowEnd 
 
 // ExpiringFileContractIDs returns the expiring file contract IDs at the given height.
 func (db *DBStore) ExpiringFileContractIDs(height uint64) []types.FileContractID {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	buf := db.bucket(bFileContractElements).getRaw(db.encHeight(height))
 	ids := make([]types.FileContractID, 0, len(buf)/32)
 	for i := 0; i < len(buf); i += 32 {
@@ -627,6 +660,8 @@ func (db *DBStore) ExpiringFileContractIDs(height uint64) []types.FileContractID
 // This should not be called unless the IDs are known to be correct, as it will overwrite
 // any existing IDs at that height.
 func (db *DBStore) OverwriteExpiringFileContractIDs(height uint64, ids []types.FileContractID) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	buf := make([]byte, len(ids)*32)
 	for i, id := range ids {
 		copy(buf[i*32:], id[:])
@@ -765,22 +800,27 @@ func (db *DBStore) revertElements(cru consensus.RevertUpdate) {
 	// reclaim it immediately.)
 }
 
-// BestIndex implements Store.
-func (db *DBStore) BestIndex(height uint64) (index types.ChainIndex, ok bool) {
+func (db *DBStore) bestIndex(height uint64) (index types.ChainIndex, ok bool) {
 	index.Height = height
 	ok = db.bucket(bMainChain).get(db.encHeight(height), &index.ID)
 	return
 }
 
-// SupplementTipTransaction implements Store.
-func (db *DBStore) SupplementTipTransaction(txn types.Transaction) (ts consensus.V1TransactionSupplement) {
+// BestIndex implements Store.
+func (db *DBStore) BestIndex(height uint64) (index types.ChainIndex, ok bool) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.bestIndex(height)
+}
+
+func (db *DBStore) supplementTipTransaction(txn types.Transaction) (ts consensus.V1TransactionSupplement) {
 	height := db.getHeight()
 	if height >= db.n.HardforkV2.RequireHeight {
 		return consensus.V1TransactionSupplement{}
 	}
 	// get tip state, for proof-trimming
-	index, _ := db.BestIndex(height)
-	cs, _ := db.State(index.ID)
+	index, _ := db.bestIndex(height)
+	cs, _ := db.getState(index.ID)
 	numLeaves := cs.Elements.NumLeaves
 
 	for _, sci := range txn.SiacoinInputs {
@@ -800,7 +840,7 @@ func (db *DBStore) SupplementTipTransaction(txn types.Transaction) (ts consensus
 	}
 	for _, sp := range txn.StorageProofs {
 		if fce, ok := db.getFileContractElement(sp.ParentID, numLeaves); ok {
-			if windowIndex, ok := db.BestIndex(fce.FileContract.WindowStart - 1); ok {
+			if windowIndex, ok := db.bestIndex(fce.FileContract.WindowStart - 1); ok {
 				ts.StorageProofs = append(ts.StorageProofs, consensus.V1StorageProofSupplement{
 					FileContract: fce.Move(),
 					WindowID:     windowIndex.ID,
@@ -811,23 +851,32 @@ func (db *DBStore) SupplementTipTransaction(txn types.Transaction) (ts consensus
 	return
 }
 
+// SupplementTipTransaction implements Store.
+func (db *DBStore) SupplementTipTransaction(txn types.Transaction) (ts consensus.V1TransactionSupplement) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.supplementTipTransaction(txn)
+}
+
 // SupplementTipBlock implements Store.
 func (db *DBStore) SupplementTipBlock(b types.Block) (bs consensus.V1BlockSupplement) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	height := db.getHeight()
 	if height >= db.n.HardforkV2.RequireHeight {
 		return consensus.V1BlockSupplement{Transactions: make([]consensus.V1TransactionSupplement, len(b.Transactions))}
 	}
 
 	// get tip state, for proof-trimming
-	index, _ := db.BestIndex(height)
-	cs, _ := db.State(index.ID)
+	index, _ := db.bestIndex(height)
+	cs, _ := db.getState(index.ID)
 	numLeaves := cs.Elements.NumLeaves
 
 	bs = consensus.V1BlockSupplement{
 		Transactions: make([]consensus.V1TransactionSupplement, len(b.Transactions)),
 	}
 	for i, txn := range b.Transactions {
-		bs.Transactions[i] = db.SupplementTipTransaction(txn)
+		bs.Transactions[i] = db.supplementTipTransaction(txn)
 	}
 	ids := db.bucket(bFileContractElements).getRaw(db.encHeight(db.getHeight() + 1))
 	for i := 0; i < len(ids); i += 32 {
@@ -842,7 +891,9 @@ func (db *DBStore) SupplementTipBlock(b types.Block) (bs consensus.V1BlockSupple
 
 // AncestorTimestamp implements Store.
 func (db *DBStore) AncestorTimestamp(id types.BlockID) (t time.Time, ok bool) {
-	cs, _ := db.State(id)
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	cs, _ := db.getState(id)
 	if cs.Index.Height > db.n.HardforkOak.Height {
 		return time.Time{}, true
 	}
@@ -869,16 +920,22 @@ func (db *DBStore) AncestorTimestamp(id types.BlockID) (t time.Time, ok bool) {
 
 // State implements Store.
 func (db *DBStore) State(id types.BlockID) (consensus.State, bool) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	return db.getState(id)
 }
 
 // AddState implements Store.
 func (db *DBStore) AddState(cs consensus.State) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	db.putState(cs)
 }
 
 // Block implements Store.
 func (db *DBStore) Block(id types.BlockID) (types.Block, *consensus.V1BlockSupplement, bool) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	_, b, bs, ok := db.getBlock(id)
 	if !ok || b == nil {
 		return types.Block{}, nil, false
@@ -888,11 +945,15 @@ func (db *DBStore) Block(id types.BlockID) (types.Block, *consensus.V1BlockSuppl
 
 // AddBlock implements Store.
 func (db *DBStore) AddBlock(b types.Block, bs *consensus.V1BlockSupplement) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	db.putBlock(b.Header(), &b, bs)
 }
 
 // PruneBlock implements Store.
 func (db *DBStore) PruneBlock(id types.BlockID) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	if bh, _, _, ok := db.getBlock(id); ok {
 		db.putBlock(bh, nil, nil)
 	}
@@ -900,6 +961,8 @@ func (db *DBStore) PruneBlock(id types.BlockID) {
 
 // Header implements Store.
 func (db *DBStore) Header(id types.BlockID) (bh types.BlockHeader, exists bool) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	return db.getBlockHeader(id)
 }
 
@@ -913,12 +976,14 @@ func (db *DBStore) shouldFlush() bool {
 
 // ApplyBlock implements Store.
 func (db *DBStore) ApplyBlock(s consensus.State, cau consensus.ApplyUpdate) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	db.applyState(s)
 	if s.Index.Height <= db.n.HardforkV2.RequireHeight {
 		db.applyElements(cau)
 	}
 	if db.shouldFlush() {
-		if err := db.Flush(); err != nil {
+		if err := db.flush(); err != nil {
 			panic(err)
 		}
 	}
@@ -926,19 +991,57 @@ func (db *DBStore) ApplyBlock(s consensus.State, cau consensus.ApplyUpdate) {
 
 // RevertBlock implements Store.
 func (db *DBStore) RevertBlock(s consensus.State, cru consensus.RevertUpdate) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	if s.Index.Height <= db.n.HardforkV2.RequireHeight {
 		db.revertElements(cru)
 	}
 	db.revertState(s)
 	if db.shouldFlush() {
-		if err := db.Flush(); err != nil {
+		if err := db.flush(); err != nil {
 			panic(err)
 		}
 	}
 }
 
-// Flush flushes any uncommitted data to the underlying DB.
-func (db *DBStore) Flush() error {
+// StoreHistoricalHeader stores a block header and its height→ID mapping
+// without a full block body. Used to make headers serveable before
+// block bodies are backfilled.
+func (db *DBStore) StoreHistoricalHeader(bh types.BlockHeader, height uint64) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	id := bh.ID()
+	index := types.ChainIndex{Height: height, ID: id}
+	db.putBlock(bh, nil, nil)
+	db.putBestIndex(index)
+	db.putBlockHeight(id, height)
+	if db.shouldFlush() {
+		if err := db.flush(); err != nil {
+			panic(err)
+		}
+	}
+}
+
+// StoreHistoricalBlock stores a block and its height→ID mapping without
+// applying consensus state. Used for backfilling blocks that won't go
+// through the full consensus pipeline.
+func (db *DBStore) StoreHistoricalBlock(b types.Block, height uint64) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	id := b.ID()
+	index := types.ChainIndex{Height: height, ID: id}
+	db.putBlock(b.Header(), &b, nil)
+	db.putBestIndex(index)
+	db.putBlockHeight(id, height)
+	if db.shouldFlush() {
+		if err := db.flush(); err != nil {
+			panic(err)
+		}
+	}
+}
+
+// flush is the internal unlocked version of Flush.
+func (db *DBStore) flush() error {
 	if db.unflushed == 0 {
 		return nil
 	}
@@ -946,6 +1049,13 @@ func (db *DBStore) Flush() error {
 	db.unflushed = 0
 	db.lastFlush = time.Now()
 	return err
+}
+
+// Flush flushes any uncommitted data to the underlying DB.
+func (db *DBStore) Flush() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.flush()
 }
 
 // NewDBStore creates a new DBStore using the provided database. The tip state
@@ -986,6 +1096,7 @@ func NewDBStore(db DB, n *consensus.Network, genesisBlock types.Block, logger Mi
 			bSiacoinElements,
 			bSiafundElements,
 			bTree,
+			bBlockHeights,
 		} {
 			if _, err := db.CreateBucket(bucket); err != nil {
 				panic(err)
@@ -1062,6 +1173,7 @@ func NewDBStoreAtCheckpoint(db DB, cs consensus.State, b types.Block, logger Mig
 			bSiacoinElements,
 			bSiafundElements,
 			bTree,
+			bBlockHeights,
 		} {
 			if _, err := db.CreateBucket(bucket); err != nil {
 				panic(err)

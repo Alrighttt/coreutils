@@ -165,11 +165,11 @@ func main() {
 		log.Panic("failed to split port", zap.Error(err))
 	}
 
-	s := syncer.New(l, cm, testutil.NewEphemeralPeerStore(), gateway.Header{
+	s := syncer.New(syncer.NewGatewayConnector(l, gateway.Header{
 		GenesisID:  genesis.ID(),
 		UniqueID:   gateway.GenerateUniqueID(),
 		NetAddress: "127.0.0.1:" + port,
-	}, syncer.WithLogger(log.Named("syncer")))
+	}, nil, 10*time.Second), cm, testutil.NewEphemeralPeerStore(), syncer.WithLogger(log.Named("syncer")))
 	defer s.Close()
 	go s.Run()
 
