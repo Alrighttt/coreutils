@@ -21,3 +21,5 @@ require (
 	golang.org/x/sys v0.41.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
 )
+
+replace go.sia.tech/core => github.com/Alrighttt/core v0.19.1-webtransport
